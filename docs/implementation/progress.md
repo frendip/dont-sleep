@@ -1,12 +1,25 @@
 # Don’t Sleep implementation progress
 
-Plan: docs/superpowers/plans/2026-10-10-dont-sleep-implementation.md
+2026-10-10. План: docs/superpowers/plans/2026-10-10-dont-sleep-implementation.md.
 
-User authorized autonomous execution to a showable working build and model selection.
+Пользователь поручил автономную разработку до показываемой версии, оркестрацию и выбор моделей. Работа велась в новом локальном Git-проекте на development, без remote, публикации или дополнительного checkout. Baseline: 1d802f3.
 
-- Planning: complete; self-review covers spec and interface boundaries.
-- Task 1: read-only platform feasibility in progress.
-- Tasks 2–7: pending.
+## Результат
 
-Ruling: work in new current project with local Git branch and file ownership, no extra checkout; no existing repository/branch to isolate.
-Ruling: proceed without another plan approval per explicit latest user instruction to continue until a working build.
+- Собрана и открыта `dist/Don’t Sleep.app`, release ARM64, 0.1.0 (1).
+- Проверены 83 Swift-теста и 26 Python-тестов PoC; подписи, установочный payload и нативные снимки.
+- Core, Platform, IPC/службы, UI и документация реализованы отдельными исполнителями.
+- Независимые Core, system-safety и UI ревью завершены; найденные ошибки устранены и проверены регрессиями.
+- Установка, изменение сна, физический тест крышки, реальное аварийное/boot-восстановление и измерения энергии агентами не выполнялись. Версия готова к первому испытанию под наблюдением, не подтверждена для работы без наблюдения.
+
+Подробности и конкретный следующий сценарий: [acceptance.md](acceptance.md). Энергия: [energy-report.md](energy-report.md).
+
+## Принятые инженерные решения
+
+- Watchdog — единственный исполнитель сна и владелец журнала; Controller — аутентифицированный посредник и независимый наблюдатель.
+- Доступной Apple signing identity нет; локальная установка root-owned LaunchDaemons закрепляет точные cdhash. Обновление требует административной настройки.
+- Установщик исполняется из захваченных байтов с проверенным встроенным SHA-256 и привязан к коду работающего приложения; защищённая копия bundle проверяется до извлечения служб.
+- Восстановление требует независимого доказательства. Готовность транспорта не означает проверенный OFF.
+- Ошибки, потерянные ответы OFF, новый UI после аварии и повторные запросы не возобновляют сессию.
+- В подтверждённом OFF закрытый интерфейс и службы ждут событий. Активное подтверждение зависит от main actor; специальная активность UI разрешает обычный сон системы и дисплея.
+- Прерванное обновление сохраняет защищённую прежнюю пару бинарников/доверия. Восстановление публикации требует выгруженных служб; после перезагрузки может понадобиться административная диагностика.

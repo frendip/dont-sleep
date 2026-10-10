@@ -2,11 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Execution status (2026-10-10):** локальная сборка создана и открыта; код и безопасные проверки завершены. Установочная и аппаратная приёмка остаются отдельным шагом с участием пользователя. Фактические результаты: [acceptance.md](../../implementation/acceptance.md). Чек-лист ниже сохранён как полный план, включая ещё не проведённые аппаратные проверки.
+
 **Goal:** Собрать локальную рабочую .app Don’t Sleep с выбранным дизайном Б, таймерами и проверяемым восстановлением сна.
 
-**Architecture:** Непривилегированный интерфейс, системный контроллер с единственным исполнителем операций питания и независимый watchdog. Логика сессии отделена от IOKit, XPC, времени и файловой системы; все сценарии отказов сначала проверяются без изменения питания Mac.
+**Architecture:** Непривилегированный интерфейс, системный контроллер-посредник и независимый watchdog — единственный исполнитель операций питания. Логика сессии отделена от IOKit, XPC, времени и файловой системы; все сценарии отказов сначала проверяются без изменения питания Mac.
 
-**Tech Stack:** Swift, SwiftUI/AppKit, IOKit, Foundation, XPC, launchd/SMAppService; Swift Package для тестируемого ядра и сборки, нативный .app bundle.
+**Tech Stack:** Swift, SwiftUI/AppKit, IOKit, Foundation, XPC, launchd с явной установкой администратором и закреплёнными хешами кода; Swift Package для тестируемого ядра и сборки, нативный .app bundle.
 
 **Spec:** [Спецификация v1.3](../specs/2026-10-10-dont-sleep-design.md). [Дизайн Б](../../design/references/menu-layout-concept.png).
 
