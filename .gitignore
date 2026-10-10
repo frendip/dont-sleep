@@ -1,0 +1,6 @@
+.build/
+dist/
+.scratch/
+.DS_Store
+__pycache__/
+.superpowers/

@@ -1,0 +1,8 @@
+/private/tmp/agent-awake-test.ip7LBAV0/watchdog.plist: OK
+READY. Logs: /private/tmp/agent-awake-test.ip7LBAV0
+Lock screen with Control-Command-Q; close lid for 5 minutes, then reopen.
+Keep AC connected. Press Control-C after reopening to request restoration.
+Watchdog attempts verified restoration by the ten-minute deadline or AC loss.
+Do not reboot: this temporary watchdog does not survive reboot.
+Watchdog confirmed restoration; see watchdog.log.
+Logs: /private/tmp/agent-awake-test.ip7LBAV0

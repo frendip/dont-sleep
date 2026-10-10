@@ -1,0 +1,10 @@
+Test mode: battery; power sample: battery 100
+/private/tmp/agent-awake-test.qB7zpSsn/watchdog.plist: OK
+READY. Logs: /private/tmp/agent-awake-test.qB7zpSsn
+Lock screen with Control-Command-Q; close lid for 5 minutes, then reopen.
+Keep charger disconnected. Battery at 20% or below stops the test.
+Press Control-C after reopening to request restoration.
+Watchdog restores sleep at deadline, on power-source change or invalid battery data.
+Do not reboot: this temporary watchdog does not survive reboot.
+Watchdog confirmed restoration; see watchdog.log.
+Logs: /private/tmp/agent-awake-test.qB7zpSsn
