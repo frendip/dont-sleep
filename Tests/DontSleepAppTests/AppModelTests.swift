@@ -184,6 +184,67 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.presentation.allowsModes)
         XCTAssertEqual(model.presentation.title, "Восстановление сна…")
     }
+    @MainActor func testReopeningIdleControlsDoesNotFlashPowerWarningWhileRefreshing() async throws {
+        let initial = ServiceResponse(snapshot: .init(state: .off, power: .init(source: .ac, percent: 78, sampledAt: 100)), serviceTime: 100)
+        let outcomes = ["fresh", "missingPower", "lowBattery", "disconnected", "oldReply"]
+        let fixtures = outcomes.map { _ in FixtureService(response: initial) }
+        let models = fixtures.map { AppModel(client: $0, noInstallationExists: { false }) {} }
+        for model in models { await model.refresh() }
+        // Hidden, verified OFF intentionally does not poll; the cached power expires.
+        try await Task.sleep(for: .seconds(6))
+        for (index, outcome) in outcomes.enumerated() {
+            let service = fixtures[index]
+            let model = models[index]
+            service.blockStatus = true
+            let refresh = Task { await model.refresh() }
+            while service.waiter == nil { await Task.yield() }
+            let surface: AppModel.MenuSurface = index.isMultiple(of: 2) ? .menu : .window
+            model.setMenuVisible(true, source: surface)
+            XCTAssertGreaterThanOrEqual(model.serviceTime, 106)
+            XCTAssertEqual(model.presentation.badge, .none, outcome)
+            XCTAssertNil(model.presentation.banner, outcome)
+            XCTAssertFalse(model.presentation.allowsModes, "Expired power must still block a start")
+            await model.toggle(true)
+            XCTAssertEqual(service.starts, 0)
+            // Let the reveal's refresh queue behind the suspended request.
+            await Task.yield()
+            switch outcome {
+            case "missingPower": service.response = .init(snapshot: .init(state: .off), serviceTime: 107)
+            case "lowBattery": service.response = .init(snapshot: .init(state: .off, power: .init(source: .battery, percent: 20, sampledAt: 107), issue: .lowBattery), serviceTime: 107)
+            case "disconnected": service.error = ServiceTransportError.timedOut
+            case "oldReply": service.response = .init(snapshot: .init(state: .off), serviceTime: 99)
+            default: service.response = .init(snapshot: .init(state: .off, power: .init(source: .ac, percent: 78, sampledAt: 107)), serviceTime: 107)
+            }
+            service.waiter?.resume(); service.waiter = nil
+            await refresh.value
+            XCTAssertEqual(model.presentation.badge, outcome == "fresh" ? .none : outcome == "disconnected" ? .error : .warning, outcome)
+            XCTAssertEqual(model.presentation.banner == nil, outcome == "fresh", outcome)
+            XCTAssertEqual(model.presentation.allowsModes, outcome == "fresh", outcome)
+            model.setMenuVisible(false, source: surface)
+        }
+    }
+    @MainActor func testReopeningControlsPreservesExistingWarnings() async {
+        let snapshots: [SessionSnapshot] = [
+            .init(state: .off),
+            .init(state: .off, power: .init(source: .ac, percent: 78, sampledAt: 90)),
+            .init(state: .off, power: .init(source: .battery, percent: 20, sampledAt: 100), issue: .lowBattery),
+            .init(state: .failed, issue: .restoreFailed)
+        ]
+        for snapshot in snapshots {
+            let service = FixtureService(response: .init(snapshot: snapshot, serviceTime: 100))
+            let model = AppModel(client: service) {}
+            await model.refresh()
+            let badge = model.presentation.badge
+            XCTAssertNotEqual(badge, .none)
+            model.setMenuVisible(true)
+            XCTAssertEqual(model.presentation.badge, badge)
+            XCTAssertNotNil(model.presentation.banner)
+            XCTAssertFalse(model.presentation.allowsModes)
+            model.setMenuVisible(false)
+            service.response = .init(snapshot: .init(state: .off), serviceTime: 101)
+            await model.requestQuit()
+        }
+    }
     @MainActor func testBackgroundRefreshKeepsOffControlsStableAndAcceptsSelection() async {
         let service = FixtureService(response: .init(snapshot: .init(state: .off, power: .init(source: .ac, percent: 78, sampledAt: 100)), serviceTime: 100))
         let model = AppModel(client: service) {}
