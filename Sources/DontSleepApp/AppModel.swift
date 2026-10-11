@@ -22,7 +22,7 @@ final class AppModel: ObservableObject {
     private let onTerminate: () -> Void
     private let noInstallationExists: () -> Bool
     private var quitGate = QuitGate()
-    private var preferredMode: Mode = .permanent
+    @Published private(set) var preferredMode: Mode = .permanent
     private var provenNeverInstalled = false
     private var stopRequested = false
     private var stopIntent = false
@@ -32,6 +32,9 @@ final class AppModel: ObservableObject {
     private var terminated = false
     private var inFlight = false
     private var refreshPending = false
+    private var pendingStart: Mode?
+    enum MenuSurface: Hashable { case menu, window }
+    private var visibleSurfaces: Set<MenuSurface> = []
     private var menuVisible = false
     private var lastResponseTime: UInt64 = 0
     private var receivedAt = ContinuousClock.now
@@ -46,8 +49,8 @@ final class AppModel: ObservableObject {
     }
     var presentation: MenuPresentation {
         var result = MenuPresentation(snapshot: snapshot, serviceTime: serviceTime, connected: connected,
-                                      operationPending: busy || installing || quitGate.requested || stopIntent || needsRecovery)
-        result.modeRequestPending = inFlight
+                                      operationPending: busy || installing || quitGate.requested || stopIntent || needsRecovery || pendingStart != nil)
+        result.selectedMode = preferredMode
         result.setupRequired = setupRequired
         result.setupActionAvailable = setupRequired || !connected
         result.previousStopReason = lastStopReason
@@ -63,10 +66,13 @@ final class AppModel: ObservableObject {
         }
         Task { await refresh() }
     }
-    func setMenuVisible(_ visible: Bool) {
-        menuVisible = visible
+    func setMenuVisible(_ visible: Bool, source: MenuSurface = .menu) {
+        if visible { visibleSurfaces.insert(source) } else { visibleSurfaces.remove(source) }
+        let anyVisible = !visibleSurfaces.isEmpty
+        guard menuVisible != anyVisible else { return }
+        menuVisible = anyVisible
         displayTicker?.cancel(); displayTicker = nil
-        if visible {
+        if menuVisible {
             displayTicker = Task { [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .seconds(1))
@@ -75,7 +81,7 @@ final class AppModel: ObservableObject {
                 }
             }
         }
-        if visible { updateClock(); Task { await refresh() } }
+        if menuVisible { updateClock(); Task { await refresh() } }
         reconcileMonitoring()
     }
     private func reconcileMonitoring() {
@@ -91,18 +97,23 @@ final class AppModel: ObservableObject {
             while !Task.isCancelled {
                 guard let self else { return }
                 let renewable = self.connected && self.ownsSession && self.snapshot?.state == .active && !self.quitGate.requested && !self.stopIntent
+                // Visible power expires after 5 seconds. Refresh at 4 to leave room for
+                // sampling/response timestamps straddling a second; hidden heartbeat stays at 5.
+                let cadence: Duration = .seconds(self.menuVisible ? 4 : 5)
                 let interval: Duration
                 if renewable {
-                    interval = self.inFlight ? .seconds(1) : max(.milliseconds(1), .seconds(5) - self.lastHeartbeatAt.duration(to: .now))
-                } else { interval = .seconds(self.menuVisible && recovering ? 1 : 5) }
+                    interval = self.inFlight ? .seconds(1) : max(.milliseconds(1), cadence - self.lastHeartbeatAt.duration(to: .now))
+                } else { interval = self.menuVisible && recovering ? .seconds(1) : cadence }
                 try? await Task.sleep(for: interval)
                 guard !Task.isCancelled else { return }
                 if self.menuVisible { self.updateClock() }
                 let mayRenew = self.connected && self.ownsSession && self.snapshot?.state == .active && !self.quitGate.requested && !self.stopIntent
-                if mayRenew && self.lastHeartbeatAt.duration(to: .now) >= .seconds(5), let identity = self.snapshot?.session?.identity {
+                if mayRenew && self.lastHeartbeatAt.duration(to: .now) >= cadence, let identity = self.snapshot?.session?.identity {
+                    // Capture UI responsiveness before any nonisolated async executor hop.
+                    let issuedAt = PlatformClock.now()
                     await self.call {
                         self.lastHeartbeatAt = .now
-                        return try await self.client.heartbeat(identity: identity)
+                        return try await self.client.heartbeat(identity: identity, issuedAt: issuedAt)
                     }
                 } else if !mayRenew {
                     await self.refresh()
@@ -115,17 +126,29 @@ final class AppModel: ObservableObject {
         await call { try await self.client.status() }
     }
     func select(_ mode: Mode) async {
-        guard presentation.allowsModes, !inFlight else { return }
-        preferredMode = mode; ownsSession = true; lastHeartbeatAt = .now
-        await call(title: "Включение…") { try await self.client.start(mode: mode) }
+        guard presentation.allowsModes else { return }
+        preferredMode = mode
     }
     func toggle(_ enabled: Bool) async {
-        if enabled { await select(preferredMode) }
-        else {
+        if enabled {
+            guard presentation.allowsModes, !terminated else { return }
+            if inFlight {
+                // Keep background reads visually quiet; serialize an explicit start behind them.
+                pendingStart = preferredMode
+                objectWillChange.send()
+                return
+            }
+            await startSelectedMode(preferredMode)
+        } else {
             guard connected, snapshot?.state == .active, !quitGate.requested else { return }
             stopIntent = true; activity.setActive(false); objectWillChange.send()
             if !inFlight { await stopForToggle() }
         }
+    }
+    private func startSelectedMode(_ mode: Mode) async {
+        let issuedAt = PlatformClock.now()
+        ownsSession = true; lastHeartbeatAt = .now
+        await call(title: "Включение…") { try await self.client.start(mode: mode, issuedAt: issuedAt) }
     }
     private func stopForToggle() async {
         stopIntent = false; recoveryStopSent = true; ownsSession = false; needsRecovery = true
@@ -133,6 +156,7 @@ final class AppModel: ObservableObject {
     }
     func requestQuit() async {
         guard quitGate.request() else { return }
+        pendingStart = nil
         activity.setActive(false)
         if provenNeverInstalled && snapshot == nil && !installing && noInstallationExists() {
             terminated = true; monitor?.cancel(); onTerminate(); return
@@ -147,10 +171,17 @@ final class AppModel: ObservableObject {
     }
     private func call(title: String? = nil, _ operation: () async throws -> ServiceResponse) async {
         guard !inFlight, !terminated else { return }
-        inFlight = true; busy = title != nil; pendingTitle = title
-        do { accept(try await operation()) }
+        inFlight = true
+        if title != nil { busy = true; pendingTitle = title }
+        var acceptedResponse = false
+        do { acceptedResponse = accept(try await operation()) }
         catch {
             connected = false; activity.setActive(false)
+            if ownsSession {
+                // A lost start/heartbeat reply cannot prove ownership or a current lease.
+                // Keep observing even with all UI hidden, and restore any surviving session.
+                ownsSession = false; needsRecovery = true; recoveryStopSent = false
+            }
             if snapshot == nil {
                 provenNeverInstalled = noInstallationExists()
                 // Missing protected files may arrive as a PlatformError before XPC starts.
@@ -158,17 +189,26 @@ final class AppModel: ObservableObject {
                 
             }
         }
-        inFlight = false; busy = false; pendingTitle = nil
+        inFlight = false
+        if busy { busy = false }
+        if pendingTitle != nil { pendingTitle = nil }
         if quitGate.requested && provenNeverInstalled && snapshot == nil && !installing && noInstallationExists() && !terminated {
             terminated = true; monitor?.cancel(); displayTicker?.cancel(); onTerminate(); return
         }
+        let requestedStart = pendingStart
+        pendingStart = nil
+        if requestedStart != nil { objectWillChange.send() }
         if quitGate.requested && !stopRequested { await stopForQuit() }
         else if stopIntent { await stopForToggle() }
+        else if let mode = requestedStart {
+            // A low battery, lost connection, or rejected response cancels the queued start.
+            if acceptedResponse && !terminated && presentation.allowsModes { await startSelectedMode(mode) }
+        }
         else if refreshPending && !terminated { refreshPending = false; await refresh() }
         reconcileMonitoring()
     }
-    private func accept(_ response: ServiceResponse) {
-        guard response.protocolVersion == 1, response.serviceTime >= lastResponseTime else { return }
+    private func accept(_ response: ServiceResponse) -> Bool {
+        guard response.protocolVersion == ServiceProtocol.version, response.serviceTime >= lastResponseTime else { return false }
         let previousIssue = snapshot?.issue
         provenNeverInstalled = false
         lastResponseTime = response.serviceTime; serviceTime = response.serviceTime; receivedAt = .now
@@ -185,6 +225,7 @@ final class AppModel: ObservableObject {
         if stopRequested && quitGate.canTerminate(after: response.snapshot) && !terminated {
             terminated = true; monitor?.cancel(); onTerminate()
         }
+        return true
     }
     private func updateClock() {
         let elapsed = max(0, receivedAt.duration(to: .now).components.seconds)

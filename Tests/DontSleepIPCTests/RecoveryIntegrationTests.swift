@@ -143,4 +143,179 @@ final class RecoveryIntegrationTests: XCTestCase {
         XCTAssertEqual(backend.applyCount, 1)
     }
 
+    // Real journal reads/writes stay in the fixture; only the unavailable storage
+    // operation is injected so this cannot touch the machine's power settings.
+    final class FaultingJournal: RecoveryJournalStoring {
+        let underlying: RecoveryJournal
+        var refuseWrites = false
+        var readOverride: (() throws -> RecoveryRecord?)?
+        init(_ underlying: RecoveryJournal) { self.underlying = underlying }
+        func load() throws -> RecoveryRecord? {
+            if let readOverride { return try readOverride() }
+            return try underlying.load()
+        }
+        func persist(_ record: RecoveryRecord) throws {
+            if refuseWrites { throw PlatformError.system("test journal write", ENOSPC) }
+            try underlying.persist(record)
+        }
+        func markRestored(sessionID: UUID) throws {
+            if refuseWrites { throw PlatformError.system("test journal completion", ENOSPC) }
+            try underlying.markRestored(sessionID: sessionID)
+        }
+    }
+
+    func testJournalWriteFailureStillRestoresDurableActiveSessionButCannotClaimOff() throws {
+        let (_, journal, backend) = try fixture()
+        let storage = FaultingJournal(journal)
+        let host = try RecoveryRuntime(backend: backend, journalStore: storage, bootID: "test")
+        _ = host.process(.start(.permanent), now: 100, power: .init(source: .ac, percent: 100, sampledAt: 100))
+        XCTAssertEqual(try journal.load()?.phase, .active)
+        storage.refuseWrites = true
+        let stopped = host.process(.stop, now: 101, power: .init(source: .ac, percent: 100, sampledAt: 101))
+        XCTAssertEqual(backend.snapshot, SleepSnapshot(actualDisabled: false, persistedDisabled: false))
+        XCTAssertEqual(backend.restoreCount, 1)
+        XCTAssertEqual(stopped.snapshot.state, .failed)
+        XCTAssertFalse(stopped.snapshot.verifiedOff)
+        XCTAssertEqual(try journal.load()?.phase, .active)
+        storage.refuseWrites = false
+        host.tick(now: 131, power: .init(source: .ac, percent: 100, sampledAt: 131))
+        XCTAssertTrue(host.response(now: 131).snapshot.verifiedOff)
+        XCTAssertEqual(try journal.load()?.phase, .restored)
+    }
+
+    func testJournalWriteFailureAfterMutationRestoresDurablePreparedSession() throws {
+        let (_, journal, backend) = try fixture()
+        let storage = FaultingJournal(journal)
+        let host = try RecoveryRuntime(backend: backend, journalStore: storage, bootID: "test")
+        backend.beforeApply = { storage.refuseWrites = true }
+        let result = host.process(.start(.permanent), now: 100, power: .init(source: .ac, percent: 100, sampledAt: 100))
+        XCTAssertEqual(backend.applyCount, 1)
+        XCTAssertEqual(backend.restoreCount, 1)
+        XCTAssertEqual(backend.snapshot, SleepSnapshot(actualDisabled: false, persistedDisabled: false))
+        XCTAssertEqual(result.snapshot.state, .failed)
+        XCTAssertFalse(result.snapshot.verifiedOff)
+        XCTAssertEqual(try journal.load()?.phase, .prepared)
+    }
+
+    func testRestorationWriteFailureRequiresMatchingReadableDurableRecord() throws {
+        for invalidProof in ["missing", "corrupt", "differentSession", "differentBoot", "differentGeneration", "differentBaseline", "restored"] {
+            let (_, journal, backend) = try fixture()
+            let storage = FaultingJournal(journal)
+            let host = try RecoveryRuntime(backend: backend, journalStore: storage, bootID: "test")
+            _ = host.process(.start(.permanent), now: 100, power: .init(source: .ac, percent: 100, sampledAt: 100))
+            let active = try XCTUnwrap(journal.load())
+            storage.refuseWrites = true
+            storage.readOverride = {
+                switch invalidProof {
+                case "missing": return nil
+                case "corrupt": throw PlatformError.invalidJournal
+                case "differentSession": return RecoveryRecord(sessionID: UUID(), generation: active.generation, bootID: active.bootID, phase: .active, original: active.original)
+                case "differentBoot": return RecoveryRecord(sessionID: active.sessionID, generation: active.generation, bootID: "other", phase: .active, original: active.original)
+                case "differentGeneration": return RecoveryRecord(sessionID: active.sessionID, generation: active.generation + 1, bootID: active.bootID, phase: .active, original: active.original)
+                case "differentBaseline": return RecoveryRecord(sessionID: active.sessionID, generation: active.generation, bootID: active.bootID, phase: .active, original: .init(actualDisabled: true, persistedDisabled: true))
+                default:
+                    var completed = active; completed.phase = .restored; return completed
+                }
+            }
+            let stopped = host.process(.stop, now: 101, power: .init(source: .ac, percent: 100, sampledAt: 101))
+            XCTAssertEqual(backend.restoreCount, 0, invalidProof)
+            XCTAssertEqual(stopped.snapshot.state, .failed, invalidProof)
+            XCTAssertFalse(stopped.snapshot.verifiedOff, invalidProof)
+        }
+    }
+
+    func testFailedInitialJournalWriteDoesNotMutateWithoutDurableProof() throws {
+        let (_, journal, backend) = try fixture()
+        let storage = FaultingJournal(journal)
+        let host = try RecoveryRuntime(backend: backend, journalStore: storage, bootID: "test")
+        storage.refuseWrites = true
+        let result = host.process(.start(.permanent), now: 100, power: .init(source: .ac, percent: 100, sampledAt: 100))
+        XCTAssertEqual(backend.applyCount, 0)
+        XCTAssertEqual(backend.restoreCount, 0)
+        XCTAssertFalse(result.snapshot.verifiedOff)
+        XCTAssertNil(try journal.load())
+    }
+
+    func testRestoreRetryPreservesOriginalSafetyStopReason() throws {
+        for reason: SessionIssue in [.leaseExpired, .lowBattery] {
+            let (_, journal, backend) = try fixture()
+            let host = try RecoveryRuntime(backend: backend, journal: journal, bootID: "test")
+            _ = host.process(.start(.permanent), now: 100, power: .init(source: .ac, percent: 100, sampledAt: 100))
+            backend.refuseRestore = true
+            let retryTime: UInt64
+            switch reason {
+            case .leaseExpired:
+                for now: UInt64 in [105, 110, 115, 120, 125, 130] {
+                    _ = host.process(.health, now: now, power: .init(source: .ac, percent: 100, sampledAt: now))
+                }
+                retryTime = 160
+            default:
+                _ = host.process(.status, now: 101, power: .init(source: .battery, percent: 20, sampledAt: 101))
+                retryTime = 131
+            }
+            XCTAssertEqual(host.response(now: retryTime - 30).snapshot.state, .failed)
+            XCTAssertEqual(host.response(now: retryTime - 30).lastStopReason, reason)
+            backend.refuseRestore = false
+            host.tick(now: retryTime, power: .init(source: .ac, percent: 100, sampledAt: retryTime))
+            XCTAssertTrue(host.response(now: retryTime).snapshot.verifiedOff)
+            XCTAssertEqual(host.response(now: retryTime).lastStopReason, reason)
+            XCTAssertEqual(try journal.load()?.stopReason, reason.rawValue)
+            let restarted = try RecoveryRuntime(backend: backend, journal: journal, bootID: "next", now: retryTime + 1)
+            XCTAssertEqual(restarted.response(now: retryTime + 1).lastStopReason, reason)
+        }
+    }
+
+    func testFiveMinuteTimerExpiresDespiteContinuingValidHeartbeats() throws {
+        let (_, journal, backend) = try fixture()
+        let host = try RecoveryRuntime(backend: backend, journal: journal, bootID: "test")
+        let active = host.process(.start(.fiveMinutes), now: 100, power: .init(source: .ac, percent: 100, sampledAt: 100))
+        let identity = try XCTUnwrap(active.snapshot.session?.identity)
+        for second in stride(from: 105, through: 395, by: 5) {
+            let now = UInt64(second)
+            let refreshed = host.process(.heartbeat(identity), now: now, power: .init(source: .ac, percent: 100, sampledAt: now))
+            XCTAssertEqual(refreshed.snapshot.state, .active)
+        }
+        let expired = host.process(.heartbeat(identity), now: 400, power: .init(source: .ac, percent: 100, sampledAt: 400))
+        XCTAssertTrue(expired.snapshot.verifiedOff)
+        XCTAssertEqual(expired.lastStopReason, .timerExpired)
+        XCTAssertEqual(backend.applyCount, 1)
+        XCTAssertEqual(backend.restoreCount, 1)
+        XCTAssertEqual(backend.snapshot, SleepSnapshot(actualDisabled: false, persistedDisabled: false))
+        XCTAssertEqual(try journal.load()?.phase, .restored)
+        XCTAssertEqual(try journal.load()?.stopReason, SessionIssue.timerExpired.rawValue)
+    }
+
+    func testDelayedStartExpiresThirtySecondsAfterUIConfirmation() throws {
+        let (_, journal, backend) = try fixture()
+        let host = try RecoveryRuntime(backend: backend, journal: journal, bootID: "test")
+        let active = host.process(.start(.fiveMinutes), now: 109, power: .init(source: .ac, percent: 100, sampledAt: 109), confirmationAt: 100)
+        XCTAssertEqual(active.snapshot.state, .active)
+        XCTAssertEqual(active.snapshot.session?.deadline, 409)
+        XCTAssertEqual(active.snapshot.session?.leaseDeadline, 130)
+        for now: UInt64 in [114, 119, 124, 129, 130] {
+            _ = host.process(.health, now: now, power: .init(source: .ac, percent: 100, sampledAt: now))
+        }
+        XCTAssertTrue(host.response(now: 130).snapshot.verifiedOff)
+        XCTAssertEqual(host.response(now: 130).lastStopReason, .leaseExpired)
+        XCTAssertEqual(backend.restoreCount, 1)
+    }
+
+    func testDelayedHeartbeatUsesOriginalConfirmationAndCannotReviveExpiredLease() throws {
+        let (_, journal, backend) = try fixture()
+        let host = try RecoveryRuntime(backend: backend, journal: journal, bootID: "test")
+        let active = host.process(.start(.fiveMinutes), now: 100, power: .init(source: .ac, percent: 100, sampledAt: 100), confirmationAt: 100)
+        let identity = try XCTUnwrap(active.snapshot.session?.identity)
+        let refreshed = host.process(.heartbeat(identity), now: 114, power: .init(source: .ac, percent: 100, sampledAt: 114), confirmationAt: 105)
+        XCTAssertEqual(refreshed.snapshot.session?.deadline, 400)
+        XCTAssertEqual(refreshed.snapshot.session?.leaseDeadline, 135)
+        for now: UInt64 in [119, 124, 129, 134] {
+            _ = host.process(.health, now: now, power: .init(source: .ac, percent: 100, sampledAt: now))
+        }
+        let expired = host.process(.heartbeat(identity), now: 135, power: .init(source: .ac, percent: 100, sampledAt: 135), confirmationAt: 130)
+        XCTAssertTrue(expired.snapshot.verifiedOff)
+        XCTAssertEqual(expired.lastStopReason, .leaseExpired)
+        XCTAssertEqual(backend.applyCount, 1)
+        XCTAssertEqual(backend.restoreCount, 1)
+    }
+
 }

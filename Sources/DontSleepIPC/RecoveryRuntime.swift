@@ -2,21 +2,32 @@ import Foundation
 import DontSleepCore
 import DontSleepPlatform
 
+// Keep fault injection at the storage boundary; production uses the protected journal.
+protocol RecoveryJournalStoring {
+    func load() throws -> RecoveryRecord?
+    func persist(_ record: RecoveryRecord) throws
+    func markRestored(sessionID: UUID) throws
+}
+extension RecoveryJournal: RecoveryJournalStoring {}
+
 /// All methods are confined to the writer's serial queue. The writer owns its
 /// lifetime flock; Controller never touches this type or the power backend.
 public final class RecoveryRuntime {
     private var engine = SessionEngine(servicesReady: false)
     private let backend: SleepBackend
-    private let journal: RecoveryJournal
+    private let journal: RecoveryJournalStoring
     private let bootID: String
     private var record: RecoveryRecord?
     private var lastGuard: UInt64?
     private var maintenance = false
     private var retryAt: UInt64?
     private var lastStopReason: SessionIssue?
-    public init(backend: SleepBackend, journal: RecoveryJournal, bootID: String, now: UInt64 = 0) throws {
-        self.backend = backend; self.journal = journal; self.bootID = bootID
-        record = try journal.load()
+    public convenience init(backend: SleepBackend, journal: RecoveryJournal, bootID: String, now: UInt64 = 0) throws {
+        try self.init(backend: backend, journalStore: journal, bootID: bootID, now: now)
+    }
+    init(backend: SleepBackend, journalStore: RecoveryJournalStoring, bootID: String, now: UInt64 = 0) throws {
+        self.backend = backend; self.journal = journalStore; self.bootID = bootID
+        record = try journalStore.load()
         lastStopReason = record?.stopReason.flatMap(SessionIssue.init(rawValue:))
         if let record, record.phase != .restored {
             lastStopReason = lastStopReason ?? .servicesUnavailable
@@ -25,16 +36,17 @@ public final class RecoveryRuntime {
     }
     public func response(now: UInt64) -> ServiceResponse { .init(snapshot: engine.snapshot, serviceTime: now, lastStopReason: lastStopReason) }
     @discardableResult
-    public func process(_ command: ServiceCommand, now: UInt64, power: PowerSnapshot) -> ServiceResponse {
+    public func process(_ command: ServiceCommand, now: UInt64, power: PowerSnapshot, confirmationAt: UInt64? = nil) -> ServiceResponse {
         // Every request is from the authenticated Controller. Guard health does
         // not renew the UI lease; only .heartbeat with matching identity does.
+        // The transport supplies the original UI issue time, never a forwarding time.
         lastGuard = now
         deliver(.power(power), now: now)
         deliver(.servicesReady(!maintenance), now: now)
         switch command {
         case .health, .status: deliver(.tick, now: now)
-        case .start(let mode): deliver(.enable(mode: mode, sessionID: UUID()), now: now)
-        case .heartbeat(let identity): deliver(.heartbeat(identity), now: now)
+        case .start(let mode): deliver(.enable(mode: mode, sessionID: UUID(), confirmationAt: confirmationAt), now: now)
+        case .heartbeat(let identity): deliver(.heartbeat(identity, confirmationAt: confirmationAt), now: now)
         case .stop: deliver(engine.snapshot.state == .failed ? .retryRestore : .disable, now: now)
         case .maintenance:
             maintenance = true
@@ -82,13 +94,29 @@ public final class RecoveryRuntime {
                 } catch { applied = false }
                 deliver(.applyResult(session.identity, verified: applied), now: now)
             case .restore(let identity):
-                lastStopReason = engine.snapshot.issue ?? lastStopReason
+                // A failed rollback is a recovery status, not a replacement
+                // for the safety event that originally stopped the session.
+                if let issue = engine.snapshot.issue, issue != .restoreFailed || lastStopReason == nil {
+                    lastStopReason = issue
+                }
                 var verified = false
                 do {
                     if var pending = record, pending.phase != .restored {
                         pending.phase = .restoring
                         pending.stopReason = lastStopReason?.rawValue
-                        try journal.persist(pending); record = pending
+                        do {
+                            try journal.persist(pending)
+                        } catch {
+                            // An unavailable write must not keep sleep disabled.
+                            // Only an independently readable, matching unfinished
+                            // record proves that this process owns the rollback.
+                            guard let durable = try journal.load(), durable.phase != .restored,
+                                  durable.sessionID == pending.sessionID,
+                                  durable.bootID == pending.bootID,
+                                  durable.generation == pending.generation,
+                                  durable.original == pending.original else { throw error }
+                        }
+                        record = pending
                         try backend.restore(pending.original)
                         verified = try backend.verify(pending.original)
                         if verified {

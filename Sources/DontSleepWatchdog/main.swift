@@ -52,14 +52,21 @@ do {
     periodic.schedule(deadline: .distantFuture)
     periodic.setEventHandler { refresh() }; periodic.resume()
     let observation = try power.observeChanges { queue.async { refresh() } }
-    let listener = try AuthenticatedListener(service: ServiceLocations.watchdog, allowedPeer: .controller) { command, reply in
-        let received = PlatformClock.now()
+    let listener = try AuthenticatedListener(service: ServiceLocations.watchdog, allowedPeer: .controller) { request, reply in
         queue.async {
             let now = PlatformClock.now()
-            guard now >= received, now - received < 10 else { reply(.failure(ServiceTransportError.timedOut)); return }
+            do { try request.validateForExecution(at: now) }
+            catch { reply(.failure(error)); return }
+            let command = request.command
             let idleHealth = command == .health && runtime.response(now: now).snapshot.verifiedOff
             if !idleHealth { cachedPower = sample() }
-            _ = runtime.process(command, now: now, power: cachedPower)
+            // Sampling IOKit can take time: reject an expired request using a
+            // fresh clock immediately before any state or power mutation.
+            let executionNow = PlatformClock.now()
+            do { try request.validateForExecution(at: executionNow) }
+            catch { reply(.failure(error)); return }
+            _ = runtime.process(command, now: executionNow, power: cachedPower,
+                                confirmationAt: request.issuedAt)
             // A bounded system operation can consume time. Assess current safety
             // before publishing success or rescheduling a deadline.
             if !idleHealth { cachedPower = sample() }

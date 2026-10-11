@@ -5,9 +5,10 @@ public enum Event: Equatable, Sendable {
     case servicesReady(Bool)
     /// Successful journal inspection found no unfinished own operation.
     case recoveryChecked
-    case enable(mode: Mode, sessionID: UUID)
+    /// The originating UI confirmation time bounds the lease even after IPC queue delay.
+    case enable(mode: Mode, sessionID: UUID, confirmationAt: UInt64? = nil)
     case disable, quit, tick, retryRestore
-    case heartbeat(SessionIdentity)
+    case heartbeat(SessionIdentity, confirmationAt: UInt64? = nil)
     case applyResult(SessionIdentity, verified: Bool)
     case restoreResult(SessionIdentity, verified: Bool)
     case bootRecovery(SessionIdentity)
@@ -81,19 +82,21 @@ public struct SessionEngine: Sendable {
             snapshot.state = servicesAvailable ? .off : .setupRequired
             snapshot.issue = idleIssue(at: now)
             effects += terminateIfSafe()
-        case .enable(let mode, let requestedID):
+        case .enable(let mode, let requestedID, let confirmationAt):
             if snapshot.session == nil {
                 snapshot.issue = idleIssue(at: now)
             }
             guard servicesAvailable, snapshot.canEnable(at: now), generation < UInt64.max,
-                  now <= UInt64.max - max(mode.durationSeconds ?? 0, Self.leaseDurationSeconds)
+                  now <= UInt64.max - (mode.durationSeconds ?? 0),
+                  let confirmedDeadline = leaseDeadline(confirmedAt: confirmationAt, now: now)
             else { return effects }
             let alreadyActive = snapshot.state == .active
+            let lease = max(snapshot.session?.leaseDeadline ?? 0, confirmedDeadline)
             let id = alreadyActive ? snapshot.session!.identity.sessionID : requestedID
             generation += 1
             let session = Session(identity: .init(sessionID: id, generation: generation), mode: mode,
                                   deadline: mode.durationSeconds.map { now + $0 },
-                                  leaseDeadline: now + Self.leaseDurationSeconds)
+                                  leaseDeadline: lease)
             snapshot.selectedMode = mode
             snapshot.session = session
             snapshot.recoveryVerified = false
@@ -112,12 +115,13 @@ public struct SessionEngine: Sendable {
             snapshot.quitRequested = true
             effects += beginRestoration(issue: nil)
             effects += terminateIfSafe()
-        case .heartbeat(let identity):
+        case .heartbeat(let identity, let confirmationAt):
             guard snapshot.state == .active, let session = snapshot.session,
-                  session.identity == identity, now <= UInt64.max - Self.leaseDurationSeconds
+                  session.identity == identity,
+                  let confirmedDeadline = leaseDeadline(confirmedAt: confirmationAt, now: now)
             else { return effects }
             let renewed = Session(identity: identity, mode: session.mode, deadline: session.deadline,
-                                  leaseDeadline: now + Self.leaseDurationSeconds)
+                                  leaseDeadline: max(session.leaseDeadline, confirmedDeadline))
             snapshot.session = renewed
             effects.append(.schedule(renewed))
         case .applyResult(let identity, let verified):
@@ -162,6 +166,13 @@ public struct SessionEngine: Sendable {
         case .tick: break
         }
         return effects
+    }
+
+    private func leaseDeadline(confirmedAt supplied: UInt64?, now: UInt64) -> UInt64? {
+        let confirmedAt = supplied ?? now
+        guard confirmedAt <= now, now - confirmedAt < Self.leaseDurationSeconds,
+              confirmedAt <= UInt64.max - Self.leaseDurationSeconds else { return nil }
+        return confirmedAt + Self.leaseDurationSeconds
     }
 
     private func powerIssue(at now: UInt64) -> SessionIssue? {
