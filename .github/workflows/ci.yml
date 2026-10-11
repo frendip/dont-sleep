@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test (macOS ARM64)
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          swift --version
+          xcrun --sdk macosx --show-sdk-version
+          /usr/bin/python3 --version
+
+      - name: Run tests and validate scripts
+        run: |
+          ./scripts/test-safe.sh
+          bash -n poc/lid-test.sh
+
+      - name: Build and verify release app
+        run: ./scripts/build-app.sh
+
+      - name: Smoke test app entry point
+        run: '"dist/Don’t Sleep.app/Contents/MacOS/DontSleepApp" --smoke-test'
+
+      - name: Archive app with executable permissions
+        run: tar -C dist -czf dist/dont-sleep-macos-arm64.tar.gz "Don’t Sleep.app"
+
+      - name: Upload app
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: dont-sleep-macos-arm64-${{ github.sha }}
+          path: dist/dont-sleep-macos-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
