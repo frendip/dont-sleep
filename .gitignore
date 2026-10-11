@@ -1,6 +1,43 @@
-.build/
-dist/
-.scratch/
+# SwiftPM and generated Xcode workspace state
+/.build/
+/.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Local bundles, previews, test logs and working archives
+/dist/
+/.scratch/
+/.local/
+/docs/validation/
+
+# Local editor and agent configuration
+/.cursor/
+/.vscode/
+/.idea/
+/.superpowers/
+
+# macOS and temporary editor files
 .DS_Store
+._*
+*.swp
+*.swo
+*~
+
+# Python test caches
 __pycache__/
-.superpowers/
+*.py[cod]
+/.venv/
+
+# Local environment, credentials and signing material
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key
+*.mobileprovision
+*.provisionprofile
+
+# Keep Package.resolved when dependencies are introduced.
+# Keep source assets and documentation images; do not ignore all PNGs or logs.
