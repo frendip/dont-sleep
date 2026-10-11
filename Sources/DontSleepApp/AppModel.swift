@@ -17,6 +17,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var pendingTitle: String?
     @Published var setupError: String?
     @Published private(set) var lastStopReason: SessionIssue?
+    @Published private var refreshingPowerOnReveal = false
     private let client: ServiceClient
     private let activity: ActivityLease
     private let onTerminate: () -> Void
@@ -51,6 +52,7 @@ final class AppModel: ObservableObject {
         var result = MenuPresentation(snapshot: snapshot, serviceTime: serviceTime, connected: connected,
                                       operationPending: busy || installing || quitGate.requested || stopIntent || needsRecovery || pendingStart != nil)
         result.selectedMode = preferredMode
+        result.refreshingPower = refreshingPowerOnReveal
         result.setupRequired = setupRequired
         result.setupActionAvailable = setupRequired || !connected
         result.previousStopReason = lastStopReason
@@ -81,7 +83,14 @@ final class AppModel: ObservableObject {
                 }
             }
         }
-        if menuVisible { updateClock(); Task { await refresh() } }
+        if menuVisible {
+            // Hidden OFF does not poll. Revalidate its healthy cached power without
+            // briefly announcing a failure caused only by advancing the display clock.
+            // The current clock still blocks starts until fresh power is available.
+            refreshingPowerOnReveal = presentation.badge == .none && presentation.banner == nil
+            updateClock()
+            Task { await refresh() }
+        }
         reconcileMonitoring()
     }
     private func reconcileMonitoring() {
@@ -189,6 +198,8 @@ final class AppModel: ObservableObject {
                 
             }
         }
+        // A reply (including a rejected one) or transport timeout ends revalidation.
+        refreshingPowerOnReveal = false
         inFlight = false
         if busy { busy = false }
         if pendingTitle != nil { pendingTitle = nil }

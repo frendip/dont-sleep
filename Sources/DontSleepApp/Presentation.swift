@@ -13,6 +13,7 @@ struct MenuPresentation {
     var setupBusy = false
     var previousStopReason: SessionIssue?
     var pendingTitle: String?
+    var refreshingPower = false
 
     init(snapshot: SessionSnapshot?, serviceTime: UInt64, connected: Bool = true, operationPending: Bool = false) {
         self.selectedMode = snapshot?.selectedMode ?? .permanent
@@ -59,7 +60,7 @@ struct MenuPresentation {
         guard connected, let snapshot else { return .error }
         if snapshot.state == .failed { return .error }
         if snapshot.issue == .lowBattery || freshPower?.blockingIssue(at: serviceTime) == .lowBattery { return .warning }
-        if freshPower == nil || snapshot.issue == .servicesUnavailable { return .warning }
+        if (freshPower == nil && !refreshingPower) || snapshot.issue == .servicesUnavailable { return .warning }
         return .none
     }
     var quitTitle: String { (canQuitWithoutService || (connected && snapshot?.verifiedOff == true)) ? "Выйти" : "Выключить и выйти" }
@@ -77,7 +78,7 @@ struct MenuPresentation {
             let suffix = snapshot.verifiedOff ? "" : " Восстанавливаем сон."
             return StatusBanner(title: "Низкий заряд", detail: "При 20% и ниже режим недоступен. Подключите зарядку." + suffix, severity: .warning)
         }
-        if freshPower == nil || freshPower?.blockingIssue(at: serviceTime) == .powerUnavailable {
+        if (freshPower == nil && !refreshingPower) || freshPower?.blockingIssue(at: serviceTime) == .powerUnavailable {
             return StatusBanner(title: "Нет данных о питании", detail: "Включение недоступно до получения актуальных данных.", severity: .warning)
         }
         if snapshot.issue == .applyFailed {
