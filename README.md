@@ -1,5 +1,7 @@
 # Don’t Sleep
 
+[![CI](https://github.com/frendip/dont-sleep/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/frendip/dont-sleep/actions/workflows/ci.yml)
+
 Нативная утилита для macOS, которая позволяет MacBook продолжать работу с закрытой крышкой. Подходит для долгих сборок, загрузок и фоновых задач: выберите срок и включите режим через значок глаза в верхней панели или компактное окно.
 
 ## Возможности
@@ -47,6 +49,8 @@ open 'dist/Don’t Sleep.app'
 Закрытый работающий MacBook оставляйте на открытой поверхности, не в сумке. Экран блокируйте самостоятельно. Предотвращение сна не гарантирует доступность интернета или продолжение любой сторонней задачи; работающий Mac расходует энергию.
 
 ## Проверки и документация
+
+[GitHub Actions](https://github.com/frendip/dont-sleep/actions/workflows/ci.yml) запускает тесты и release-сборку ARM64 на каждом PR и push в `main`. Успешный прогон сохраняет архив `.app` на 7 дней. Это сборка с ad-hoc подписью для проверки, без нотарификации и установки служб. Подробнее — [CI и артефакты](docs/development.md#ci-и-артефакты).
 
 ```sh
 ./scripts/test-safe.sh
