@@ -349,4 +349,63 @@ final class SessionEngineTests: XCTestCase {
         XCTAssertEqual(engine.snapshot.issue, .applyFailed)
     }
 
+    func testDelayedStartUsesConfirmationTimeForLeaseAndExecutionTimeForTimer() {
+        var engine = SessionEngine()
+        _ = engine.handle(.power(.init(source: .ac, percent: 80, sampledAt: 109)), now: 109)
+        _ = engine.handle(.enable(mode: .fiveMinutes, sessionID: id, confirmationAt: 100), now: 109)
+        XCTAssertEqual(engine.snapshot.state, .enabling)
+        XCTAssertEqual(engine.snapshot.session?.leaseDeadline, 130)
+        XCTAssertEqual(engine.snapshot.session?.deadline, 409)
+    }
+
+    func testInvalidConfirmationCannotStartSession() {
+        for (now, confirmation): (UInt64, UInt64) in [(100, 101), (100, 70), (.max - 20, .max - 20)] {
+            var engine = SessionEngine()
+            _ = engine.handle(.power(.init(source: .ac, percent: 80, sampledAt: now)), now: now)
+            XCTAssertTrue(engine.handle(.enable(mode: .permanent, sessionID: id, confirmationAt: confirmation), now: now).isEmpty)
+            XCTAssertEqual(engine.snapshot.state, .off)
+        }
+    }
+
+    func testDelayedHeartbeatDoesNotExtendTimerOrReviveExpiredLease() {
+        var engine = start(.fiveMinutes, at: 100)
+        let identity = engine.snapshot.session!.identity
+        _ = engine.handle(.power(.init(source: .ac, percent: 80, sampledAt: 114)), now: 114)
+        _ = engine.handle(.heartbeat(identity, confirmationAt: 105), now: 114)
+        XCTAssertEqual(engine.snapshot.session?.leaseDeadline, 135)
+        XCTAssertEqual(engine.snapshot.session?.deadline, 400)
+        _ = engine.handle(.power(.init(source: .ac, percent: 80, sampledAt: 134)), now: 134)
+        _ = engine.handle(.heartbeat(identity, confirmationAt: 130), now: 135)
+        XCTAssertEqual(engine.snapshot.state, .restoring)
+        XCTAssertEqual(engine.snapshot.issue, .leaseExpired)
+    }
+
+    func testOlderConfirmationCannotShortenCurrentLease() {
+        var engine = start(.fiveMinutes, at: 100)
+        let identity = engine.snapshot.session!.identity
+        _ = engine.handle(.power(.init(source: .ac, percent: 80, sampledAt: 110)), now: 110)
+        _ = engine.handle(.heartbeat(identity, confirmationAt: 110), now: 110)
+        XCTAssertEqual(engine.snapshot.session?.leaseDeadline, 140)
+        _ = engine.handle(.power(.init(source: .ac, percent: 80, sampledAt: 114)), now: 114)
+        _ = engine.handle(.heartbeat(identity, confirmationAt: 105), now: 114)
+        XCTAssertEqual(engine.snapshot.session?.leaseDeadline, 140)
+        _ = engine.handle(.enable(mode: .permanent, sessionID: id, confirmationAt: 105), now: 114)
+        XCTAssertEqual(engine.snapshot.session?.leaseDeadline, 140)
+    }
+
+    func testInvalidHeartbeatConfirmationCannotRenewLease() {
+        var engine = start(.fiveMinutes, at: 100)
+        let identity = engine.snapshot.session!.identity
+        _ = engine.handle(.power(.init(source: .ac, percent: 80, sampledAt: 110)), now: 110)
+        for confirmation: UInt64 in [111, 80] {
+            XCTAssertTrue(engine.handle(.heartbeat(identity, confirmationAt: confirmation), now: 110).isEmpty)
+            XCTAssertEqual(engine.snapshot.session?.leaseDeadline, 130)
+        }
+        var nearOverflow = start(.permanent, at: .max - 40)
+        let nearOverflowIdentity = nearOverflow.snapshot.session!.identity
+        _ = nearOverflow.handle(.power(.init(source: .ac, percent: 80, sampledAt: .max - 20)), now: .max - 20)
+        XCTAssertTrue(nearOverflow.handle(.heartbeat(nearOverflowIdentity, confirmationAt: .max - 20), now: .max - 20).isEmpty)
+        XCTAssertEqual(nearOverflow.snapshot.session?.leaseDeadline, .max - 10)
+    }
+
 }

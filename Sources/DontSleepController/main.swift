@@ -54,8 +54,8 @@ do {
             queue.async { pending = false; observe(result) }
         }
     }
-    let listener = try AuthenticatedListener(service: ServiceLocations.controller, allowedPeer: .app) { command, reply in
-        writer.send(command) { result in
+    let listener = try AuthenticatedListener(service: ServiceLocations.controller, allowedPeer: .app) { request, reply in
+        writer.forward(request) { result in
             queue.async { observe(result) }
             reply(result)
         }

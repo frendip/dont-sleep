@@ -1,14 +1,13 @@
-import SwiftUI
 import AppKit
 import DontSleepIPC
 
 @main
-struct DontSleepApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var model: AppModel
+@MainActor enum DontSleepApp {
     private static var lifetimeLock: InstanceLock?
 
-    init() {
+    static func main() {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
         let args = CommandLine.arguments
         if let index = args.firstIndex(of: "--render-previews"), args.indices.contains(index + 1) {
             do { try NativePreviews.render(to: URL(fileURLWithPath: args[index + 1], isDirectory: true)); exit(0) }
@@ -26,14 +25,14 @@ struct DontSleepApp: App {
             } catch { fputs("Installation payload verification failed: \(error)\n", stderr); exit(1) }
         }
         if args.contains("--smoke-test") {
-            print("Don’t Sleep: native SwiftUI menu entry point loaded. No service connection or power change was made.")
+            print("Don’t Sleep: native AppKit entry point loaded. No service connection or power change was made.")
             exit(0)
         }
         do {
             let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("local.dontsleep.app", isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             guard let lock = try InstanceLock.acquire(at: directory.appendingPathComponent("instance.lock")) else {
-                if let pid = InstanceGate.existingPID(current: getpid(), bundleID: Bundle.main.bundleIdentifier, processes: NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, $0.bundleIdentifier) }) { NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateAllWindows]) }
+                if let pid = InstanceGate.existingPID(current: getpid(), bundleID: Bundle.main.bundleIdentifier, processes: NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, $0.bundleIdentifier) }) { ReopenRequest.send(to: pid) }
                 exit(0)
             }
             Self.lifetimeLock = lock
@@ -43,39 +42,72 @@ struct DontSleepApp: App {
             NSApplication.shared.terminate(nil)
         }
         AppDelegate.model = model
-        _model = StateObject(wrappedValue: model)
-    }
-    var body: some Scene {
-        MenuBarExtra {
-            MenuPanel(presentation: model.presentation, setupError: model.setupError,
-                      onToggle: { enabled in Task { await model.toggle(enabled) } },
-                      onSelect: { mode in Task { await model.select(mode) } },
-                      onQuit: { Task { await model.requestQuit() } },
-                      onSetup: { Task { await model.installService() } })
-                .onAppear { model.setMenuVisible(true) }
-                .onDisappear { model.setMenuVisible(false) }
-        } label: {
-            EyeMark(bolt: model.presentation.bolt, badge: model.presentation.badge)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("Don’t Sleep. \(model.presentation.title)")
-                .help("Don’t Sleep — \(model.presentation.title)")
-        }
-        .menuBarExtraStyle(.window)
-        .commands {
-            CommandGroup(replacing: .appTermination) {
-                Button(model.presentation.quitTitle) { Task { await model.requestQuit() } }
-                    .keyboardShortcut("q", modifiers: .command)
-            }
-        }
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        // Keep one owner for application lifetime. SwiftUI is hosted only in our
+        // controls window; there is no Settings scene for macOS to open/restore.
+        withExtendedLifetime(delegate) { app.run() }
     }
 }
 
-@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     static var model: AppModel?
     static var allowTermination = false
+    private var controls: ControlsWindowController?
+    private var statusMenu: NativeStatusMenuController?
+    private var reopenObserver: NSObjectProtocol?
+    override init() {
+        super.init()
+        // This notification can only bring UI forward. It cannot enable a mode or bypass the quit gate.
+        reopenObserver = DistributedNotificationCenter.default().addObserver(forName: ReopenRequest.name, object: String(getpid()), queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.showControls() }
+        }
+    }
+    deinit { if let reopenObserver { DistributedNotificationCenter.default().removeObserver(reopenObserver) } }
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
-        Self.model?.startMonitoring()
+        configureApplicationMenu()
+        if let model = Self.model {
+            statusMenu = NativeStatusMenuController(model: model, onOpenWindow: { [weak self] in self?.showControls() })
+            model.startMonitoring()
+        }
+        showControls()
+    }
+    func configureApplicationMenu() {
+        let main = NSMenu()
+        let application = NSMenu(title: "Don’t Sleep")
+        let rootItem = NSMenuItem()
+        rootItem.submenu = application
+        main.addItem(rootItem)
+        let open = NSMenuItem(title: "Открыть окно…", action: #selector(openControls), keyEquivalent: "o")
+        open.target = self
+        open.keyEquivalentModifierMask = .command
+        application.addItem(open)
+        application.addItem(.separator())
+        let quit = NSMenuItem(title: Self.model?.presentation.quitTitle ?? "Выйти", action: #selector(requestQuit), keyEquivalent: "q")
+        quit.target = self
+        quit.keyEquivalentModifierMask = .command
+        application.addItem(quit)
+        NSApp.mainMenu = main
+    }
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(requestQuit) {
+            menuItem.title = Self.model?.presentation.quitTitle ?? "Выйти"
+        }
+        return true
+    }
+    @objc private func openControls() { showControls() }
+    @objc private func requestQuit() { Task { await Self.model?.requestQuit() } }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showControls()
+        return false
+    }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    private func showControls() {
+        guard let model = Self.model else { return }
+        if controls == nil { controls = ControlsWindowController(model: model) }
+        controls?.showControls()
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if Self.allowTermination { return .terminateNow }

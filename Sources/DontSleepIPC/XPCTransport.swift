@@ -24,10 +24,20 @@ public final class XPCChannel {
     private var nonce = UUID()
     private var sequence: UInt64 = 0
     public init(service: String, peer: TrustRole) { self.service = service; self.peer = peer }
-    public func send(_ command: ServiceCommand, completion: @escaping (Result<ServiceResponse, Error>) -> Void) {
+    public func send(_ command: ServiceCommand, issuedAt: UInt64 = PlatformClock.now(), completion: @escaping (Result<ServiceResponse, Error>) -> Void) {
+        forward(ServiceRequest(command: command, nonce: UUID(), sequence: 1, issuedAt: issuedAt), completion: completion)
+    }
+    public func forward(_ originatingRequest: ServiceRequest, completion: @escaping (Result<ServiceResponse, Error>) -> Void) {
         let pending = PendingReply(completion)
+        let now = PlatformClock.now()
+        let remaining = originatingRequest.expiresAt > now ? min(ServiceProtocol.requestLifetimeSeconds, originatingRequest.expiresAt - now) : 0
+        // The client deadline includes local queue delay, trust loading, and every forwarding hop.
+        DispatchQueue.global().asyncAfter(deadline: .now() + Double(remaining)) {
+            pending.finish(.failure(ServiceTransportError.timedOut))
+        }
         queue.async { [self] in
             do {
+                try originatingRequest.validateForExecution(at: PlatformClock.now())
                 let trust = try TrustPolicy.load()
                 let connection: NSXPCConnection
                 if let existing = self.connection { connection = existing }
@@ -46,7 +56,8 @@ public final class XPCChannel {
                 }
                 guard self.sequence < UInt64.max else { throw ServiceTransportError.invalidMessage }
                 self.sequence += 1
-                let request = ServiceRequest(command: command, nonce: self.nonce, sequence: self.sequence)
+                let request = originatingRequest.forwarded(nonce: self.nonce, sequence: self.sequence)
+                try request.validateForExecution(at: PlatformClock.now())
                 let data = try JSONEncoder().encode(request)
                 guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
                     pending.finish(.failure(error)); connection.invalidate()
@@ -59,19 +70,15 @@ public final class XPCChannel {
                           let envelope = try? JSONDecoder().decode(WireReply.self, from: data) else {
                         pending.finish(.failure(ServiceTransportError.invalidMessage)); return
                     }
-                    if let response = envelope.response, response.protocolVersion == 1 { pending.finish(.success(response)) }
+                    if let response = envelope.response, response.protocolVersion == ServiceProtocol.version { pending.finish(.success(response)) }
                     else { pending.finish(.failure(envelope.error ?? .invalidMessage)) }
-                }
-                DispatchQueue.global().asyncAfter(deadline: .now() + 12) {
-                    // This is deliberately independent of the service worker queue.
-                    pending.finish(.failure(ServiceTransportError.timedOut))
                 }
             } catch { pending.finish(.failure(error)) }
         }
     }
-    public func send(_ command: ServiceCommand) async throws -> ServiceResponse {
+    public func send(_ command: ServiceCommand, issuedAt: UInt64 = PlatformClock.now()) async throws -> ServiceResponse {
         try await withCheckedThrowingContinuation { continuation in
-            send(command) { continuation.resume(with: $0) }
+            send(command, issuedAt: issuedAt) { continuation.resume(with: $0) }
         }
     }
 }
@@ -80,13 +87,13 @@ public final class XPCServiceClient: ServiceClient {
     private let channel = XPCChannel(service: ServiceLocations.controller, peer: .controller)
     public init() {}
     public func status() async throws -> ServiceResponse { try await channel.send(.status) }
-    public func start(mode: Mode) async throws -> ServiceResponse { try await channel.send(.start(mode)) }
-    public func heartbeat(identity: SessionIdentity) async throws -> ServiceResponse { try await channel.send(.heartbeat(identity)) }
+    public func start(mode: Mode, issuedAt: UInt64) async throws -> ServiceResponse { try await channel.send(.start(mode), issuedAt: issuedAt) }
+    public func heartbeat(identity: SessionIdentity, issuedAt: UInt64) async throws -> ServiceResponse { try await channel.send(.heartbeat(identity), issuedAt: issuedAt) }
     public func stop() async throws -> ServiceResponse { try await channel.send(.stop) }
 }
 
 public final class AuthenticatedListener: NSObject, NSXPCListenerDelegate {
-    public typealias Handler = (ServiceCommand, @escaping (Result<ServiceResponse, Error>) -> Void) -> Void
+    public typealias Handler = (ServiceRequest, @escaping (Result<ServiceResponse, Error>) -> Void) -> Void
     private let listener: NSXPCListener
     private let trust: TrustPolicy
     private let allowedPeer: TrustRole
@@ -118,7 +125,7 @@ private final class RequestEndpoint: NSObject, SleepXPCProtocol {
         do {
             let request = try gate.decode(data)
             guard allowHealth || (request.command != .health && request.command != .maintenance) else { throw ServiceTransportError.unauthorized }
-            handler(request.command) { result in
+            handler(request) { result in
                 let envelope: WireReply
                 switch result {
                 case .success(let response): envelope = WireReply(response: response, error: nil)

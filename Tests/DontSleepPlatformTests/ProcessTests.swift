@@ -51,6 +51,41 @@ final class ProcessTests: XCTestCase {
   XCTAssertEqual(result.exitCode, 0)
   XCTAssertEqual(String(data: result.output, encoding: .utf8), "inherited")
  }
+ func testChildKeepsWriterLockAfterOwnerDescriptorCloses() throws {
+  let directory = URL(fileURLWithPath: "/private/tmp").appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+  defer { try? FileManager.default.removeItem(at: directory) }
+  var owner: WriterLock? = try WriterLock(directory: directory, expectedOwner: getuid())
+  try owner!.acquire()
+  let inheritedFD = owner!.descriptor
+  let ready = directory.appendingPathComponent("child-ready")
+  let release = directory.appendingPathComponent("child-release")
+  let completed = expectation(description: "harmless child reaped")
+  DispatchQueue.global().async {
+   defer { completed.fulfill() }
+   do {
+    let result = try BoundedProcess(timeout: 5).runProgram(path: "/bin/sh", arguments: ["-c",
+      "printf ready > \"$1\"; while [ ! -e \"$2\" ]; do /bin/sleep 0.02; done", "lock-test", ready.path, release.path], inheritingLockFD: inheritedFD)
+    XCTAssertEqual(result.exitCode, 0)
+   } catch { XCTFail("Child fixture failed: \(error)") }
+  }
+  let deadline = Date().addingTimeInterval(3)
+  while !FileManager.default.fileExists(atPath: ready.path), Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+  let childStarted = FileManager.default.fileExists(atPath: ready.path)
+  XCTAssertTrue(childStarted, "Child must inherit the descriptor before the owner closes it")
+  if childStarted {
+   owner = nil // Closing the owner's last descriptor models its process death.
+   let replacement = try WriterLock(directory: directory, expectedOwner: getuid())
+   XCTAssertThrowsError(try replacement.acquire()) { XCTAssertEqual($0 as? PlatformError, .writerBusy) }
+   try Data().write(to: release)
+   wait(for: [completed], timeout: 6)
+   XCTAssertNoThrow(try replacement.acquire(), "Only child exit may release the inherited lock")
+   replacement.release()
+  } else {
+   try Data().write(to: release)
+   wait(for: [completed], timeout: 6)
+  }
+ }
  func testRealPowerWriterRefusesMissingLock() {
   XCTAssertThrowsError(try BoundedProcess().run(.setDisabled(true), inheritingLockFD: nil)) { XCTAssertEqual($0 as? PlatformError, .writerNotHeld) }
  }

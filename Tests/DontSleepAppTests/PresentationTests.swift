@@ -17,7 +17,7 @@ final class PresentationTests: XCTestCase {
         let p = MenuPresentation(snapshot: SessionSnapshot(state: .active, selectedMode: .eightHours, session: session, power: .init(source: .ac, percent: 100, sampledAt: 100)), serviceTime: 100)
         XCTAssertEqual(p.remaining, "Осталось 8:00:00")
         XCTAssertEqual(p.charge, "Заряд 100%")
-        XCTAssertTrue(p.allowsModes)
+        XCTAssertFalse(p.allowsModes)
         XCTAssertTrue(p.switchOn)
         XCTAssertTrue(p.bolt)
         XCTAssertEqual(p.quitTitle, "Выключить и выйти")

@@ -6,7 +6,7 @@ struct MenuPresentation {
     let serviceTime: UInt64
     let connected: Bool
     let operationPending: Bool
-    var modeRequestPending = false
+    var selectedMode: Mode
     var setupRequired = false
     var canQuitWithoutService = false
     var setupActionAvailable = false
@@ -15,6 +15,7 @@ struct MenuPresentation {
     var pendingTitle: String?
 
     init(snapshot: SessionSnapshot?, serviceTime: UInt64, connected: Bool = true, operationPending: Bool = false) {
+        self.selectedMode = snapshot?.selectedMode ?? .permanent
         self.snapshot = snapshot; self.serviceTime = serviceTime
         self.connected = connected; self.operationPending = operationPending
     }
@@ -47,7 +48,7 @@ struct MenuPresentation {
             : String(format: "%llu:%02llu", seconds / 60, seconds % 60)
         return "Осталось \(time)"
     }
-    var allowsModes: Bool { connected && !operationPending && !modeRequestPending && !setupRequired && (snapshot?.canEnable(at: serviceTime) ?? false) }
+    var allowsModes: Bool { snapshot?.verifiedOff == true && connected && !operationPending && !setupRequired && (snapshot?.canEnable(at: serviceTime) ?? false) }
     var showsSwitch: Bool {
         connected && !setupRequired && snapshot != nil && snapshot?.state != .failed && snapshot?.state != .setupRequired
     }

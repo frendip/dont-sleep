@@ -29,9 +29,10 @@ struct EyeBolt: Shape {
 struct EyeMark: View {
     let bolt: Bool
     var badge: StatusBadge = .none
+    var compact = false
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
-            Image(nsImage: EyeArtwork.templateImage(bolt: bolt))
+            Image(nsImage: EyeArtwork.templateImage(bolt: bolt, compact: compact))
                 .renderingMode(.template).resizable().scaledToFit()
                 .frame(width: 27, height: 19)
             if badge != .none {
@@ -47,7 +48,15 @@ struct EyeMark: View {
 }
 
 enum EyeArtwork {
-    @MainActor static func templateImage(bolt: Bool) -> NSImage {
+    // Stable image identity prevents MenuBarExtra replacing its icon on every clock/status update.
+    @MainActor private static let templates = [
+        makeTemplate(bolt: false, compact: false), makeTemplate(bolt: true, compact: false),
+        makeTemplate(bolt: false, compact: true), makeTemplate(bolt: true, compact: true)
+    ]
+    @MainActor static func templateImage(bolt: Bool, compact: Bool = false) -> NSImage {
+        templates[(compact ? 2 : 0) + (bolt ? 1 : 0)]
+    }
+    @MainActor private static func makeTemplate(bolt: Bool, compact: Bool) -> NSImage {
         let image = NSImage(size: NSSize(width: 28, height: 20), flipped: true) { rect in
             NSColor.black.setStroke()
             let eye = NSBezierPath()
@@ -63,6 +72,8 @@ enum EyeArtwork {
             }
             return true
         }
+        // MenuBarExtra uses the NSImage dimensions, not the surrounding SwiftUI frame.
+        if compact { image.size = NSSize(width: 20, height: 14) }
         image.isTemplate = true
         return image
     }

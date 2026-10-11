@@ -23,3 +23,11 @@ final class InstanceLock {
     }
     deinit { flock(descriptor, LOCK_UN); close(descriptor) }
 }
+
+/// Wake the existing UI when Launch Services starts a separate copy instead of sending reopen.
+enum ReopenRequest {
+    static let name = Notification.Name("local.dontsleep.showControls")
+    static func send(to pid: Int32) {
+        DistributedNotificationCenter.default().postNotificationName(name, object: String(pid), userInfo: nil, deliverImmediately: true)
+    }
+}
