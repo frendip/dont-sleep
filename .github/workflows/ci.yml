@@ -47,15 +47,3 @@ jobs:
 
       - name: Smoke test app entry point
         run: '"dist/Don’t Sleep.app/Contents/MacOS/DontSleepApp" --smoke-test'
-
-      - name: Archive app with executable permissions
-        run: tar -C dist -czf dist/dont-sleep-macos-arm64.tar.gz "Don’t Sleep.app"
-
-      - name: Upload app
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: dont-sleep-macos-arm64-${{ github.sha }}
-          path: dist/dont-sleep-macos-arm64.tar.gz
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 0

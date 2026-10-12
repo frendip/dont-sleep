@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-dmg:
+    name: Test and package DMG (macOS ARM64)
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      RELEASE_TAG: ${{ github.ref_name }}
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag, main ancestry and release metadata
+        id: source
+        run: |
+          ./scripts/release_metadata.py "$RELEASE_TAG"
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
+          git merge-base --is-ancestor HEAD origin/main
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Check toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          swift --version
+          /usr/bin/python3 --version
+
+      - name: Run tests
+        run: |
+          ./scripts/test-safe.sh
+          bash -n poc/lid-test.sh
+
+      - name: Build and verify app (ad-hoc signing)
+        run: ./scripts/build-app.sh
+
+      - name: Verify bundle version and prepare release notes
+        run: |
+          ./scripts/release_metadata.py "$RELEASE_TAG" \
+            --app "$PWD/dist/Don’t Sleep.app" \
+            --notes-output dist/release/release-notes.md
+
+      - name: Package and verify DMG
+        run: ./scripts/build-dmg.py
+
+      - name: Transfer verified release files to draft job
+        id: upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/release/DontSleep-macos-arm64.dmg
+            dist/release/SHA256SUMS
+            dist/release/release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  draft-release:
+    name: Create GitHub Release draft
+    needs: build-dmg
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check out the verified commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.build-dmg.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download verified release files
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.build-dmg.outputs.artifact-id }}
+          merge-multiple: true
+          path: dist/release
+
+      - name: Check tag still points to the verified commit
+        shell: bash
+        run: |
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$(git rev-parse HEAD)"
+
+      - name: Create draft with DMG and first-launch instructions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 scripts/publish-draft.py "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" --directory dist/release | tee release-url.txt
+          {
+            echo '### Release draft'
+            cat release-url.txt
+            echo 'Download the DMG, verify installation and first launch, then publish the draft manually.'
+            echo 'This app uses ad-hoc signing, without Apple Developer ID or notarization.'
+          } >> "$GITHUB_STEP_SUMMARY"
