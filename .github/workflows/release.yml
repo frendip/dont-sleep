@@ -48,6 +48,11 @@ jobs:
           swift --version
           /usr/bin/python3 --version
 
+      - name: Prepare and test DMG layout tools
+        run: |
+          ./scripts/setup-dmg-tools.sh
+          .build/dmg-tools/bin/python3 -m unittest discover -s scripts/dmg-tests
+
       - name: Run tests
         run: |
           ./scripts/test-safe.sh

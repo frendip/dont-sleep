@@ -32,16 +32,44 @@ class DmgCleanupTests(unittest.TestCase):
                     raise subprocess.CalledProcessError(1, ['hdiutil', 'detach'])
         with patch.object(self.module, 'verify_app', return_value=('0.1.2', '3')), \
                 patch.object(self.module, 'verify_bundle'), \
+                patch.object(self.module, 'render_assets', return_value=self.output), \
                 patch.object(self.module, 'run', side_effect=fake_run), \
                 patch.object(self.module.os.path, 'ismount', return_value=True):
             self.module.build(self.output / 'app', self.output)
+
+    def test_design_failure_does_not_replace_previous_image_or_checksum(self):
+        checksum = self.output / 'SHA256SUMS'
+        checksum.write_bytes(b'previous checksum')
+        mounted = [False]
+
+        def fake_run(*args):
+            if args[0] == '/usr/bin/hdiutil':
+                if args[1] == 'create':
+                    Path(args[-1]).write_bytes(b'unverified writable image')
+                elif args[1] == 'attach':
+                    mounted[0] = True
+                elif args[1] == 'detach':
+                    mounted[0] = False
+
+        with patch.object(self.module, 'verify_app', return_value=('0.1.1', '3')), \
+                patch.object(self.module, 'verify_bundle'), \
+                patch.object(self.module, 'render_assets', return_value=self.output), \
+                patch.object(self.module, 'configure_design', side_effect=ValueError('bad layout')), \
+                patch.object(self.module, 'run', side_effect=fake_run), \
+                patch.object(self.module.os.path, 'ismount', side_effect=lambda _: mounted[0]):
+            with self.assertRaisesRegex(ValueError, 'bad layout'):
+                self.module.build(self.output / 'app', self.output)
+        self.assertFalse(mounted[0])
+        self.assertEqual(list(self.output.glob('.dmg-build.*')), [])
+        self.assertEqual(self.previous.read_bytes(), b'previous valid image')
+        self.assertEqual(checksum.read_bytes(), b'previous checksum')
 
     def test_failed_detach_retains_staging_and_previous_image(self):
         with self.assertRaises(subprocess.CalledProcessError):
             self.fail_during_attach(fail_detach=True)
         stages = list(self.output.glob('.dmg-build.*'))
         self.assertEqual(len(stages), 1)
-        self.assertEqual((stages[0] / 'DontSleep-macos-arm64.dmg').read_bytes(), b'new unverified image')
+        self.assertEqual((stages[0] / 'writable.dmg').read_bytes(), b'new unverified image')
         self.assertEqual(self.previous.read_bytes(), b'previous valid image')
 
     def test_successful_detach_cleans_failed_build_without_replacing_previous_image(self):
