@@ -99,6 +99,97 @@ final class BackendTests: XCTestCase {
   XCTAssertThrowsError(try PMSetSleepBackend.parsePersisted(" SleepDisabled 2\n"))
   XCTAssertThrowsError(try PMSetSleepBackend.parsePersisted("AC Power:\n sleep 1\n"))
  }
+ // Real pmset -g output reported on macOS Tahoe 26.2, before disablesleep was set.
+ static let unsetSettings = """
+ System-wide power settings:
+ Currently in use:
+  standby              1
+  Sleep On Power Button 1
+  hibernatefile        /var/vm/sleepimage
+  powernap             1
+  networkoversleep     0
+  disksleep            0
+  sleep                1 (sleep prevented by sharingd, powerd, WhatsApp)
+  hibernatemode        3
+  ttyskeepawake        1
+  displaysleep         0
+  tcpkeepalive         1
+  powermode            2
+  womp                 0
+ """
+ func testUnsetPersistedSettingCanBeEnabledAndRestored() throws {
+  let runner = StatefulRunner()
+  let backend = PMSetSleepBackend(runner: runner, actualState: { runner.actualDisabled })
+  let original = try backend.read()
+  XCTAssertEqual(original, SleepSnapshot(actualDisabled: false, persistedDisabled: false))
+  try backend.applyDisabled()
+  XCTAssertEqual(try backend.read(), SleepSnapshot(actualDisabled: true, persistedDisabled: true))
+  try backend.restore(original)
+  XCTAssertTrue(try backend.verify(original))
+  XCTAssertEqual(runner.writes, [true, false])
+ }
+ func testMissingSettingRequiresACompleteSystemSettingsSection() throws {
+  for text in ["", "Currently in use:\n sleep 1\n", "System-wide power settings:\n",
+               "System-wide power settings:\n SleepDisabled", "System-wide power settings:\nCurrently in use:\n",
+               "Currently in use:\n sleep 1\nSystem-wide power settings:\n",
+               "System-wide power settings:\n SleepDisabled: 0\nCurrently in use:\n sleep 1\n",
+               "System-wide power settings:\nSystem-wide power settings:\nCurrently in use:\n sleep 1\n"] {
+   XCTAssertThrowsError(try PMSetSleepBackend.parsePersisted(text), text)
+  }
+  XCTAssertFalse(try PMSetSleepBackend.parsePersisted("System-wide power settings:\n DestroyFVKeyOnStandby 0\n VACTDisabled 1\nCurrently in use:\n sleep 1\n"))
+ }
+ func testUnsetSettingDoesNotOverrideDisabledOrUnreadableActualState() {
+  let runner = StatefulRunner()
+  let disabled = PMSetSleepBackend(runner: runner, actualState: { true })
+  XCTAssertThrowsError(try disabled.applyDisabled()) { XCTAssertEqual($0 as? PlatformError, .baselineDisabled) }
+  let unreadable = PMSetSleepBackend(runner: runner, actualState: { throw PlatformError.invalidPowerState })
+  XCTAssertThrowsError(try unreadable.applyDisabled())
+  XCTAssertTrue(runner.writes.isEmpty)
+ }
+ func testUnsetSettingDoesNotConfirmApplicationWithoutBothReadbacks() {
+  for updatesActual in [false, true] {
+   let runner = StatefulRunner()
+   runner.updatesActual = updatesActual
+   runner.updatesPersisted = !updatesActual
+   let backend = PMSetSleepBackend(runner: runner, actualState: { runner.actualDisabled })
+   XCTAssertThrowsError(try backend.applyDisabled()) { XCTAssertEqual($0 as? PlatformError, .verificationFailed) }
+   XCTAssertEqual(runner.writes, [true])
+  }
+ }
+ func testRestorationFromUnsetBaselineRequiresBothReadbacks() throws {
+  for updatesActual in [false, true] {
+   let runner = StatefulRunner()
+   let backend = PMSetSleepBackend(runner: runner, actualState: { runner.actualDisabled })
+   let original = try backend.read()
+   try backend.applyDisabled()
+   runner.updatesActual = updatesActual
+   runner.updatesPersisted = !updatesActual
+   XCTAssertThrowsError(try backend.restore(original)) { XCTAssertEqual($0 as? PlatformError, .verificationFailed) }
+   XCTAssertFalse(try backend.verify(original))
+  }
+ }
+ final class StatefulRunner: SystemCommandRunning {
+  var actualDisabled = false
+  var persistedDisabled: Bool?
+  var updatesActual = true
+  var updatesPersisted = true
+  var writes: [Bool] = []
+  func run(_ command: PowerCommand, inheritingLockFD: Int32?) throws -> CommandResult {
+   switch command {
+   case .readSettings:
+    let text: String
+    if let persistedDisabled {
+     text = "System-wide power settings:\n SleepDisabled \(persistedDisabled ? 1 : 0)\nCurrently in use:\n sleep 1\n"
+    } else { text = BackendTests.unsetSettings }
+    return CommandResult(exitCode: 0, output: Data(text.utf8))
+   case .setDisabled(let disabled):
+    writes.append(disabled)
+    if updatesActual { actualDisabled = disabled }
+    if updatesPersisted { persistedDisabled = disabled }
+    return CommandResult(exitCode: 0, output: Data())
+   }
+  }
+ }
  func testExistingDisabledStateIsNeverAdopted() {
   XCTAssertThrowsError(try SleepSnapshot(actualDisabled: true, persistedDisabled: false).validateBaseline())
   XCTAssertThrowsError(try SleepSnapshot(actualDisabled: false, persistedDisabled: true).validateBaseline())
