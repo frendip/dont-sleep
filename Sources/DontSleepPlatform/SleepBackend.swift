@@ -79,8 +79,23 @@ public final class PMSetSleepBackend: SleepBackend {
         guard result.exitCode == 0 else { throw PlatformError.commandFailed(result.exitCode) }
     }
     public static func parsePersisted(_ text: String) throws -> Bool {
-        let matches = text.split(whereSeparator: \.isNewline).map { $0.split(whereSeparator: \.isWhitespace) }
-            .filter { $0.first == "SleepDisabled" }
+        let lines = text.split(whereSeparator: \.isNewline).map { $0.split(whereSeparator: \.isWhitespace) }
+            .filter { !$0.isEmpty }
+        let matches = lines.filter { $0.first == "SleepDisabled" }
+        if matches.isEmpty {
+            // pmset prints this header only after reading the system settings dictionary.
+            // powerd treats an absent SleepDisabled key as false. Require the next
+            // section too, so empty, failed or incomplete output cannot become a baseline.
+            let systemHeaders = lines.indices.filter { lines[$0] == ["System-wide", "power", "settings:"] }
+            let liveHeaders = lines.indices.filter { lines[$0] == ["Currently", "in", "use:"] }
+            guard systemHeaders == [0], liveHeaders.count == 1,
+                  let live = liveHeaders.first, live > 0, live + 1 < lines.count,
+                  lines[1..<live].allSatisfy({ row in
+                      row.count == 2 && ["DestroyFVKeyOnStandby", "VACTDisabled"].contains(row[0])
+                          && (row[1] == "0" || row[1] == "1")
+                  }) else { throw PlatformError.invalidPowerState }
+            return false
+        }
         guard matches.count == 1, matches[0].count == 2 else { throw PlatformError.invalidPowerState }
         switch matches[0][1] { case "0": return false; case "1": return true; default: throw PlatformError.invalidPowerState }
     }
